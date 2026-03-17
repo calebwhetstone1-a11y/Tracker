@@ -2,7 +2,6 @@ import io
 import os
 import re
 import tempfile
-from collections import Counter
 from typing import List, Dict, Tuple
 
 import pandas as pd
@@ -15,11 +14,30 @@ from PIL import Image, ImageOps
 st.set_page_config(page_title="Delivery OCR Tracker", layout="wide")
 
 # -----------------------------
+# Session state setup
+# -----------------------------
+if "processed" not in st.session_state:
+    st.session_state.processed = False
+
+if "raw_df" not in st.session_state:
+    st.session_state.raw_df = pd.DataFrame()
+
+if "summary_df" not in st.session_state:
+    st.session_state.summary_df = pd.DataFrame()
+
+if "ocr_workbook_bytes" not in st.session_state:
+    st.session_state.ocr_workbook_bytes = None
+
+if "updated_tracker_bytes" not in st.session_state:
+    st.session_state.updated_tracker_bytes = None
+
+if "unmatched_df" not in st.session_state:
+    st.session_state.unmatched_df = pd.DataFrame()
+
+# -----------------------------
 # Helpers
 # -----------------------------
-
 def load_pages_from_upload(uploaded_file) -> List[Image.Image]:
-    """Return grayscale PIL images for all pages in an uploaded image/PDF."""
     ext = os.path.splitext(uploaded_file.name)[1].lower()
 
     if ext == ".pdf":
@@ -56,12 +74,10 @@ def parse_items_from_text(text: str, source_file: str, page_number: int) -> List
             continue
         line_lower = line.lower()
 
-        # Start table capture
         if "item" in line_lower and "descr" in line_lower:
             capture = True
             continue
 
-        # Stop when next section begins
         if "colli" in line_lower:
             capture = False
 
@@ -109,11 +125,6 @@ def summarize_items(raw_df: pd.DataFrame) -> pd.DataFrame:
 
 
 def update_tracker_workbook(tracker_bytes: bytes, summary_df: pd.DataFrame, mode: str) -> Tuple[bytes, pd.DataFrame]:
-    """
-    mode: 'overwrite' or 'add'
-    Returns updated workbook bytes and unmatched items df.
-    Updates all sheets that contain Part # and Qty Recei headers in row 1.
-    """
     with tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx") as tmp:
         tmp.write(tracker_bytes)
         tmp_path = tmp.name
@@ -191,18 +202,22 @@ def build_ocr_results_workbook(raw_df: pd.DataFrame, summary_df: pd.DataFrame) -
 # -----------------------------
 # UI
 # -----------------------------
-
 st.title("Delivery OCR Tracker")
-st.caption("Upload delivery PDFs/images, review OCR results, and optionally update your tracking workbook.")
+st.write(
+    "1. Upload delivery PDFs or images.\n"
+    "2. Optionally upload your tracking workbook.\n"
+    "3. Click Process Deliveries.\n"
+    "4. Download the OCR results and updated tracker."
+)
 
 with st.sidebar:
     st.header("Settings")
-    update_mode = st.radio(
-        "Tracker update mode",
-        options=["overwrite", "add"],
+    update_mode_label = st.radio(
+        "Qty Received behavior",
+        options=["Replace Qty Received", "Add to Qty Received"],
         index=0,
-        help="Overwrite replaces Qty Recei with the OCR total. Add increases the existing Qty Recei.",
     )
+    update_mode = "overwrite" if update_mode_label == "Replace Qty Received" else "add"
     show_page_previews = st.checkbox("Show cropped page previews", value=False)
 
 col1, col2 = st.columns(2)
@@ -212,6 +227,7 @@ with col1:
         "Upload delivery images or PDFs",
         type=["pdf", "png", "jpg", "jpeg"],
         accept_multiple_files=True,
+        key="delivery_files",
     )
 
 with col2:
@@ -219,11 +235,10 @@ with col2:
         "Upload tracking workbook (optional)",
         type=["xlsx"],
         accept_multiple_files=False,
+        key="tracker_file",
     )
 
-process = st.button("Process Deliveries", type="primary", use_container_width=True)
-
-if process:
+if st.button("Process Deliveries", type="primary", use_container_width=True):
     if not delivery_files:
         st.error("Upload at least one delivery image or PDF first.")
         st.stop()
@@ -253,66 +268,83 @@ if process:
     raw_df = pd.DataFrame(all_items)
     summary_df = summarize_items(raw_df)
 
+    st.session_state.raw_df = raw_df
+    st.session_state.summary_df = summary_df
+    st.session_state.ocr_workbook_bytes = build_ocr_results_workbook(raw_df, summary_df)
+    st.session_state.updated_tracker_bytes = None
+    st.session_state.unmatched_df = pd.DataFrame()
+
+    if tracker_file is not None and not summary_df.empty:
+        updated_tracker_bytes, unmatched_df = update_tracker_workbook(
+            tracker_file.getvalue(), summary_df, update_mode
+        )
+        st.session_state.updated_tracker_bytes = updated_tracker_bytes
+        st.session_state.unmatched_df = unmatched_df
+
+    st.session_state.processed = True
+
+# -----------------------------
+# Results area
+# -----------------------------
+if st.session_state.processed:
+    raw_df = st.session_state.raw_df
+    summary_df = st.session_state.summary_df
+
     st.subheader("OCR Results")
     c1, c2, c3 = st.columns(3)
-    c1.metric("Files processed", len(delivery_files))
-    c2.metric("Raw OCR rows", 0 if raw_df.empty else len(raw_df))
-    c3.metric("Unique items", 0 if summary_df.empty else len(summary_df))
+    c1.metric("Raw OCR rows", 0 if raw_df.empty else len(raw_df))
+    c2.metric("Unique items", 0 if summary_df.empty else len(summary_df))
+    c3.metric("Tracker matches pending review", 0 if st.session_state.unmatched_df.empty else len(st.session_state.unmatched_df))
 
     if raw_df.empty:
-        st.warning("No item rows were found in the uploaded files.")
-        st.stop()
+        st.warning("No item rows were found.")
+    else:
+        tab1, tab2, tab3 = st.tabs(["Summarized Totals", "Raw OCR Data", "Downloads"])
 
-    tab1, tab2, tab3 = st.tabs(["Summarized Totals", "Raw OCR Data", "Downloads"])
+        with tab1:
+            st.dataframe(summary_df, use_container_width=True)
 
-    with tab1:
-        st.dataframe(summary_df, use_container_width=True)
+        with tab2:
+            st.dataframe(raw_df, use_container_width=True)
 
-    with tab2:
-        st.dataframe(raw_df, use_container_width=True)
-
-    ocr_workbook_bytes = build_ocr_results_workbook(raw_df, summary_df)
-
-    with tab3:
-        st.download_button(
-            label="Download OCR Results Workbook",
-            data=ocr_workbook_bytes,
-            file_name="OCR_Results.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            use_container_width=True,
-        )
-
-        if tracker_file is not None:
-            try:
-                updated_tracker_bytes, unmatched_df = update_tracker_workbook(
-                    tracker_file.getvalue(), summary_df, update_mode
-                )
-
+        with tab3:
+            @st.fragment
+            def download_section():
                 st.download_button(
-                    label="Download Updated Tracking Workbook",
-                    data=updated_tracker_bytes,
-                    file_name="Updated_Tracking_File.xlsx",
+                    label="Download OCR Results Workbook",
+                    data=st.session_state.ocr_workbook_bytes,
+                    file_name="OCR_Results.xlsx",
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                     use_container_width=True,
                 )
 
-                if unmatched_df.empty:
-                    st.success("All OCR items matched a tracker Part #.")
-                else:
-                    st.warning("Some OCR items were not found in the tracker.")
-                    st.dataframe(unmatched_df, use_container_width=True)
-
-                    unmatched_bytes = io.BytesIO()
-                    unmatched_df.to_excel(unmatched_bytes, index=False)
-                    unmatched_bytes.seek(0)
+                if st.session_state.updated_tracker_bytes is not None:
                     st.download_button(
-                        label="Download Unmatched Items",
-                        data=unmatched_bytes,
-                        file_name="Unmatched_OCR_Items.xlsx",
+                        label="Download Updated Tracking Workbook",
+                        data=st.session_state.updated_tracker_bytes,
+                        file_name="Updated_Tracking_File.xlsx",
                         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                         use_container_width=True,
                     )
-            except Exception as e:
-                st.error(f"Tracker update failed: {e}")
-        else:
-            st.info("Upload a tracking workbook to enable tracker updates.")
+
+                    if st.session_state.unmatched_df.empty:
+                        st.success("All OCR items matched a tracker Part #.")
+                    else:
+                        st.warning("Some OCR items were not found in the tracker.")
+                        st.dataframe(st.session_state.unmatched_df, use_container_width=True)
+
+                        unmatched_bytes = io.BytesIO()
+                        st.session_state.unmatched_df.to_excel(unmatched_bytes, index=False)
+                        unmatched_bytes.seek(0)
+
+                        st.download_button(
+                            label="Download Unmatched Items",
+                            data=unmatched_bytes,
+                            file_name="Unmatched_OCR_Items.xlsx",
+                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                            use_container_width=True,
+                        )
+                else:
+                    st.info("No tracking workbook was uploaded for this run.")
+
+            download_section()
