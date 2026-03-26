@@ -16,6 +16,19 @@ st.title("PDF OCR Tracker Updater")
 
 
 # -----------------------------
+# Session State
+# -----------------------------
+if "processed" not in st.session_state:
+    st.session_state.processed = False
+
+if "results" not in st.session_state:
+    st.session_state.results = {}
+
+if "run_id" not in st.session_state:
+    st.session_state.run_id = 0
+
+
+# -----------------------------
 # Helpers
 # -----------------------------
 def normalize_text(value):
@@ -159,7 +172,15 @@ def process_delivery_files(delivery_files):
     all_items = []
     preview_images = []
 
-    for uploaded_file in delivery_files:
+    progress = st.progress(0, text="Starting OCR processing...")
+    total_files = len(delivery_files)
+
+    for file_index, uploaded_file in enumerate(delivery_files, start=1):
+        progress.progress(
+            int(((file_index - 1) / total_files) * 100),
+            text=f"Processing file {file_index} of {total_files}: {uploaded_file.name}",
+        )
+
         pages = load_pages_from_upload(uploaded_file)
         stitched_img = stitch_pages_vertically(pages)
         cropped_img = crop_table_region(stitched_img)
@@ -257,6 +278,8 @@ def process_delivery_files(delivery_files):
                     "PageNumber": "ALL",
                 }
             )
+
+    progress.progress(100, text="OCR processing complete.")
 
     raw_df = pd.DataFrame(all_items)
 
@@ -456,16 +479,32 @@ delivery_files = st.file_uploader(
     "Upload delivery PDFs/images",
     type=["pdf", "png", "jpg", "jpeg", "tif", "tiff"],
     accept_multiple_files=True,
+    key=f"delivery_files_{st.session_state.run_id}",
 )
 
 tracker_file = st.file_uploader(
     "Upload tracker workbook",
     type=["xlsx", "xlsm"],
+    key=f"tracker_file_{st.session_state.run_id}",
 )
 
-run_button = st.button("Process Files", type="primary")
+col_a, col_b = st.columns([1, 1])
 
-if run_button:
+with col_a:
+    process_clicked = st.button("Process Files", type="primary")
+
+with col_b:
+    reset_clicked = st.button("Reset / Run New Files")
+
+
+if reset_clicked:
+    st.session_state.processed = False
+    st.session_state.results = {}
+    st.session_state.run_id += 1
+    st.rerun()
+
+
+if process_clicked:
     if not delivery_files:
         st.error("Please upload at least one delivery PDF/image.")
         st.stop()
@@ -473,6 +512,9 @@ if run_button:
     if not tracker_file:
         st.error("Please upload the tracker workbook.")
         st.stop()
+
+    st.session_state.processed = False
+    st.session_state.results = {}
 
     with st.spinner("Running OCR and updating tracker..."):
         raw_df, summary_df, preview_images = process_delivery_files(delivery_files)
@@ -494,6 +536,35 @@ if run_button:
         unmatched_export_bytes = None
         if unmatched_df is not None and not unmatched_df.empty:
             unmatched_export_bytes = dataframe_to_excel_bytes({"Unmatched_OCR_Items": unmatched_df})
+
+    st.session_state.results = {
+        "raw_df": raw_df,
+        "summary_df": summary_df,
+        "matched_df": matched_df,
+        "not_found_df": not_found_df,
+        "unmatched_df": unmatched_df,
+        "preview_images": preview_images,
+        "updated_tracker_bytes": updated_tracker_bytes,
+        "ocr_results_bytes": ocr_results_bytes,
+        "unmatched_export_bytes": unmatched_export_bytes,
+    }
+
+    st.session_state.processed = True
+    st.rerun()
+
+
+if st.session_state.processed:
+    results = st.session_state.results
+
+    raw_df = results["raw_df"]
+    summary_df = results["summary_df"]
+    matched_df = results["matched_df"]
+    not_found_df = results["not_found_df"]
+    unmatched_df = results["unmatched_df"]
+    preview_images = results["preview_images"]
+    updated_tracker_bytes = results["updated_tracker_bytes"]
+    ocr_results_bytes = results["ocr_results_bytes"]
+    unmatched_export_bytes = results["unmatched_export_bytes"]
 
     st.success("Processing complete.")
 
@@ -519,6 +590,10 @@ if run_button:
     else:
         st.info("No unmatched items.")
 
+    if not not_found_df.empty:
+        with st.expander("Summary items not found in tracker", expanded=False):
+            st.dataframe(not_found_df, use_container_width=True)
+
     st.download_button(
         label="Download Updated Tracker",
         data=updated_tracker_bytes,
@@ -540,3 +615,5 @@ if run_button:
             file_name="Unmatched_OCR_Items.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         )
+else:
+    st.info("Upload your files and click Process Files. The app will only rerun processing when you press that button or reset the session.")
